@@ -4,26 +4,14 @@ import {
   type PayloadAction,
 } from "@reduxjs/toolkit";
 
-import { getUserProfile } from "../../services/api";
+import { getUserProfile, logoutUpstox } from "../../services/api";
 
 import type { AuthState, UpstoxProfileResponse } from "../../types/auth";
 
 /**
  * Fetch profile from FastAPI.
  *
- * FastAPI internally:
- *
- * React
- *   ↓
- * /user/profile
- *   ↓
- * Neon
- *   ↓
- * Upstox access token
- *   ↓
- * Upstox API
- *   ↓
- * profile
+ * React → /user/profile → Neon → Upstox access token → Upstox API → profile
  */
 export const fetchUserProfile = createAsyncThunk<
   UpstoxProfileResponse,
@@ -44,6 +32,33 @@ export const fetchUserProfile = createAsyncThunk<
         error instanceof Error
           ? error.message
           : "Unable to fetch Upstox profile",
+      );
+    }
+  },
+);
+
+/**
+ * Disconnect Upstox.
+ *
+ * React → DELETE /logout → FastAPI revokes Upstox session + deletes tokens
+ */
+export const logoutUser = createAsyncThunk<
+  void,
+  void,
+  {
+    rejectValue: string;
+  }
+>(
+  "auth/logoutUser",
+
+  async (_, { rejectWithValue }) => {
+    try {
+      await logoutUpstox();
+    } catch (error) {
+      return rejectWithValue(
+        error instanceof Error
+          ? error.message
+          : "Couldn’t disconnect Upstox",
       );
     }
   },
@@ -113,6 +128,19 @@ const authSlice = createSlice({
         state.isAuthenticated = false;
 
         state.error = action.payload ?? "Unable to connect to Upstox";
+      })
+
+      /**
+       * Logout succeeded — reset auth state
+       */
+      .addCase(logoutUser.fulfilled, (state) => {
+        state.profile = null;
+
+        state.status = "idle";
+
+        state.error = null;
+
+        state.isAuthenticated = false;
       });
   },
 });

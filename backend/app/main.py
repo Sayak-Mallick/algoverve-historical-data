@@ -488,3 +488,48 @@ async def get_user_profile(
         ) from exc
 
     return profile_data
+
+
+# ============================================================================
+# UPSTOX LOGOUT
+# ============================================================================
+
+
+@app.delete("/logout")
+async def logout_upstox(db: Session = Depends(get_db)):
+    """
+    Ends the Upstox session and removes stored tokens.
+    Idempotent: returns success even if nothing is connected.
+    """
+
+    token_record = db.query(UpstoxToken).order_by(UpstoxToken.created_at.desc()).first()
+
+    upstox_revoked = True
+
+    if token_record and token_record.access_token:
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                response = await client.delete(
+                    "https://api.upstox.com/v2/logout",
+                    headers={
+                        "Accept": "application/json",
+                        "Authorization": f"Bearer {token_record.access_token}",
+                    },
+                )
+            # 401 = token already expired/invalid → session is already dead
+            upstox_revoked = response.status_code in (200, 401)
+        except httpx.RequestError:
+            upstox_revoked = False
+
+    # Always clear local tokens so the app can't keep using them
+    try:
+        db.query(UpstoxToken).delete()
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to clear Upstox token: {str(exc)}",
+        ) from exc
+
+    return {"status": "success", "data": {"upstox_revoked": upstox_revoked}}

@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode } from "react";
 
-import { fetchUserProfile } from "./features/auth/authSlice";
+import { fetchUserProfile, logoutUser } from "./features/auth/authSlice";
 import { loginWithUpstox } from "./services/api";
 import { useAppDispatch, useAppSelector } from "./app/hooks";
 import "./App.css";
@@ -109,6 +109,8 @@ const btnBase =
   "inline-flex items-center justify-center gap-1.5 rounded font-bold transition-[background,box-shadow] duration-75 disabled:cursor-default disabled:opacity-50 motion-reduce:transition-none";
 const btnPrimary = `${btnBase} h-9 px-4 text-[15px] bg-green text-white hover:bg-green-hover hover:shadow-[0_1px_4px_rgba(0,0,0,0.3)] active:bg-green-press active:shadow-none`;
 const btnSecondary = `${btnBase} h-7 px-2.5 text-[13px] border border-line-strong bg-white text-ink hover:bg-surface-2 hover:shadow-[0_1px_3px_rgba(0,0,0,0.08)] active:bg-[#f0f0f0] active:shadow-none`;
+const btnDanger = `${btnBase} h-9 px-4 text-[15px] bg-danger text-white hover:bg-[#c8184f] hover:shadow-[0_1px_4px_rgba(0,0,0,0.3)] active:bg-[#b0153f] active:shadow-none`;
+const btnGhost = `${btnBase} h-9 px-4 text-[15px] border border-line-strong bg-white text-ink hover:bg-surface-2`;
 const tile = "grid shrink-0 place-items-center bg-[#5a2fc2] font-black text-white";
 
 /* ---------- Small components ---------- */
@@ -148,8 +150,9 @@ function Section({ title, children }: { title: string; children: ReactNode }) {
 function Tag({ children, off = false, title }: { children: ReactNode; off?: boolean; title?: string }) {
   return (
     <span title={title}
-      className={`inline-flex items-center gap-1 rounded px-2 py-px text-[13px] font-bold ${off ? "bg-[#f0f0f0] text-ink-3 line-through decoration-ink-3/60" : "bg-green-tint text-green-press"
-        }`}>
+      className={`inline-flex items-center gap-1 rounded px-2 py-px text-[13px] font-bold ${
+        off ? "bg-[#f0f0f0] text-ink-3 line-through decoration-ink-3/60" : "bg-green-tint text-green-press"
+      }`}>
       {children}
     </span>
   );
@@ -186,12 +189,60 @@ function CopyValue({ value }: { value: string }) {
     <span className="inline-flex items-center gap-2">
       <span className="font-bold tracking-wide select-all">{value}</span>
       <button type="button" onClick={copy} aria-label={copied ? "Copied" : `Copy ${value}`}
-        className={`inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[13px] hover:bg-surface-2 ${copied ? "text-green" : "text-ink-2"
-          }`}>
+        className={`inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[13px] hover:bg-surface-2 ${
+          copied ? "text-green" : "text-ink-2"
+        }`}>
         <Icon name={copied ? "check" : "copy"} size={14} />
         {copied ? "Copied" : "Copy"}
       </button>
     </span>
+  );
+}
+
+interface ConfirmDisconnectProps {
+  brokerName: string;
+  pending: boolean;
+  error: string | null;
+  onCancel: () => void;
+  onConfirm: () => void;
+}
+
+function ConfirmDisconnect({ brokerName, pending, error, onCancel, onConfirm }: ConfirmDisconnectProps) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && !pending) onCancel();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onCancel, pending]);
+
+  return (
+    <div className="fixed inset-0 z-50 grid place-items-center bg-black/50 p-4"
+      onMouseDown={(e) => e.target === e.currentTarget && !pending && onCancel()}>
+      <div role="alertdialog" aria-modal="true" aria-labelledby="disconnect-title"
+        className="w-full max-w-[440px] rounded-lg bg-white p-7 shadow-[0_18px_48px_rgba(0,0,0,0.35)]">
+        <h2 id="disconnect-title" className="text-[22px] leading-tight font-black">
+          Disconnect {brokerName}?
+        </h2>
+        <p className="mt-3">
+          Algoverve will stop receiving data from {brokerName} and your session there will end.
+          You can connect again anytime.
+        </p>
+        {error && (
+          <p role="alert" className="mt-3 flex gap-1.5 text-[13px] text-danger">
+            <Icon name="alert" size={16} className="mt-px" /> {error}
+          </p>
+        )}
+        <div className="mt-6 flex justify-end gap-3">
+          <button type="button" className={btnGhost} onClick={onCancel} disabled={pending} autoFocus>
+            Cancel
+          </button>
+          <button type="button" className={btnDanger} onClick={onConfirm} disabled={pending}>
+            {pending ? "Disconnecting…" : "Disconnect"}
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -213,6 +264,9 @@ const asProfile = (raw: unknown): BrokerProfile | null => {
 function App() {
   const dispatch = useAppDispatch();
   const [tab, setTab] = useState<Tab>("account");
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const [loggingOut, setLoggingOut] = useState(false);
+  const [logoutError, setLogoutError] = useState<string | null>(null);
 
   const { profile, status, error, isAuthenticated } = useAppSelector((state) => state.auth);
 
@@ -225,6 +279,25 @@ function App() {
   }, [dispatch]);
 
   const isLoading = status === "loading";
+
+  const closeConfirm = () => {
+    setConfirmOpen(false);
+    setLogoutError(null);
+  };
+
+  const handleLogout = async () => {
+    setLoggingOut(true);
+    setLogoutError(null);
+    try {
+      await dispatch(logoutUser()).unwrap();
+      setConfirmOpen(false);
+      setTab("account");
+    } catch (err) {
+      setLogoutError(typeof err === "string" ? err : "Couldn’t disconnect. Try again.");
+    } finally {
+      setLoggingOut(false);
+    }
+  };
   const p = asProfile(profile);
 
   const name = p?.user_name ? titleCase(p.user_name) : "";
@@ -261,10 +334,11 @@ function App() {
           <div title={name || undefined}
             className="relative grid size-[26px] place-items-center rounded bg-[#e8912d] text-[11px] font-black text-white">
             {isAuthenticated && name ? initials(name) : "?"}
-            <span className={`absolute -right-[3px] -bottom-[3px] size-2.5 rounded-full ${isAuthenticated
+            <span className={`absolute -right-[3px] -bottom-[3px] size-2.5 rounded-full ${
+              isAuthenticated
                 ? "bg-presence ring-2 ring-aubergine-950"
                 : "bg-aubergine-950 ring-[1.5px] ring-inset ring-white/70"
-              }`} />
+            }`} />
           </div>
         </div>
       </header>
@@ -368,6 +442,11 @@ function App() {
                   onClick={() => dispatch(fetchUserProfile())} disabled={isLoading}>
                   <Icon name="refresh" size={16} /> Refresh
                 </button>
+                <button type="button"
+                  className={`${btnSecondary} text-danger hover:border-danger-line hover:bg-danger-tint`}
+                  onClick={() => setConfirmOpen(true)}>
+                  Disconnect
+                </button>
               </div>
 
               {!p.is_active && (
@@ -385,10 +464,11 @@ function App() {
                 {TABS.map(({ id, label }) => (
                   <button key={id} type="button" role="tab" aria-selected={tab === id}
                     onClick={() => setTab(id)}
-                    className={`relative py-2.5 font-bold hover:text-ink ${tab === id
+                    className={`relative py-2.5 font-bold hover:text-ink ${
+                      tab === id
                         ? "text-ink after:absolute after:inset-x-0 after:-bottom-px after:h-0.5 after:rounded-t-sm after:bg-green"
                         : "text-ink-2"
-                      }`}>
+                    }`}>
                     {label}
                   </button>
                 ))}
@@ -461,6 +541,16 @@ function App() {
           )}
         </div>
       </main>
+
+      {confirmOpen && (
+        <ConfirmDisconnect
+          brokerName={brokerName}
+          pending={loggingOut}
+          error={logoutError}
+          onCancel={closeConfirm}
+          onConfirm={handleLogout}
+        />
+      )}
     </div>
   );
 }
