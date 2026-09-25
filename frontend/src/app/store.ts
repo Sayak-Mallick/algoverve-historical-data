@@ -1,19 +1,14 @@
 import { configureStore } from "@reduxjs/toolkit";
 
 import authReducer from "../features/auth/authSlice";
+import sessionReducer from "../features/session/sessionSlice";
 
 export const store = configureStore({
   reducer: {
-    auth: authReducer,
+    session: sessionReducer, // who you are in Algoverve
+    auth: authReducer, // your Upstox connection
   },
 });
 
-/**
- * RootState represents the entire Redux state.
- */
 export type RootState = ReturnType<typeof store.getState>;
-
-/**
- * AppDispatch represents our Redux dispatch function.
- */
 export type AppDispatch = typeof store.dispatch;

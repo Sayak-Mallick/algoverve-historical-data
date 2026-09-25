@@ -30,9 +30,15 @@
 }
 
 @layer base {
-  html, body, #root { height: 100%; }
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
   body {
     @apply bg-aubergine-950 font-sans text-[15px] leading-[1.4667] text-ink antialiased;
   }
-  :focus-visible { @apply outline-2 outline-offset-2 outline-focus; }
+  :focus-visible {
+    @apply outline-2 outline-offset-2 outline-focus;
+  }
 }

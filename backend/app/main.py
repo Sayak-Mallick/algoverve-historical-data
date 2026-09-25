@@ -1,535 +1,283 @@
 import os
-from urllib.parse import quote
+from urllib.parse import urlencode
 
 import httpx
 from app.database import Base, engine, get_db
-from app.models import UpstoxToken
+from app.models import BrokerAccount, User
+from app.security import (
+    clear_session_cookie,
+    create_oauth_state,
+    decrypt_token,
+    encrypt_token,
+    get_current_user,
+    get_optional_user,
+    hash_password,
+    read_oauth_state,
+    set_session_cookie,
+    verify_password,
+)
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
+from pydantic import BaseModel, EmailStr, Field, field_validator
 from sqlalchemy.orm import Session
-
-# ============================================================================
-# ENVIRONMENT
-# ============================================================================
 
 load_dotenv()
 
-
 UPSTOX_API_KEY = os.getenv("UPSTOX_API_KEY")
 UPSTOX_API_SECRET = os.getenv("UPSTOX_API_SECRET")
+REDIRECT_URI = os.getenv("REDIRECT_URI", "http://localhost:8000/callback")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
 
-REDIRECT_URI = os.getenv(
-    "REDIRECT_URI",
-    "http://127.0.0.1:8000/callback",
-)
+UPSTOX = "upstox"
+UPSTOX_BASE = "https://api.upstox.com/v2"
 
-FRONTEND_URL = os.getenv(
-    "FRONTEND_URL",
-    "http://localhost:5173",
-)
-
-
-# ============================================================================
-# FASTAPI APP
-# ============================================================================
-
-app = FastAPI(
-    title="Algoverve Historical Data Backend",
-    description="Algoverve backend for Upstox authentication and market data",
-    version="1.0.0",
-)
-
-
-# ============================================================================
-# CORS
-# ============================================================================
+app = FastAPI(title="Algoverve Backend", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ],
-    allow_credentials=True,
+    allow_origins=list({FRONTEND_URL, "http://localhost:5173"}),
+    allow_credentials=True,  # lets the browser send the session cookie
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
-# ============================================================================
-# DATABASE
-# ============================================================================
-
-# Create database tables if they don't already exist.
-#
-# For development this is fine.
-# For production, use Alembic migrations instead.
-#
+# Dev only. Use Alembic migrations in production.
 Base.metadata.create_all(bind=engine)
 
 
-# ============================================================================
-# STARTUP
-# ============================================================================
+# =============================================================== SCHEMAS
+class SignUpIn(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    email: EmailStr
+    password: str = Field(min_length=8)
+
+    @field_validator("password")
+    @classmethod
+    def bcrypt_limit(cls, v: str) -> str:
+        if len(v.encode()) > 72:
+            raise ValueError("Password must be 72 bytes or fewer")
+        return v
 
 
-@app.on_event("startup")
-async def startup_event():
-    """
-    Runs when FastAPI starts.
-    """
-
-    print("=" * 60)
-    print("Algoverve Historical Data Backend")
-    print("=" * 60)
-
-    print(f"Frontend URL : {FRONTEND_URL}")
-    print(f"Redirect URI : {REDIRECT_URI}")
-
-    if UPSTOX_API_KEY:
-        print("Upstox API Key : configured")
-    else:
-        print("Upstox API Key : MISSING")
-
-    if UPSTOX_API_SECRET:
-        print("Upstox API Secret : configured")
-    else:
-        print("Upstox API Secret : MISSING")
-
-    print("=" * 60)
+class SignInIn(BaseModel):
+    email: EmailStr
+    password: str
 
 
-# ============================================================================
-# ROOT
-# ============================================================================
+class UserOut(BaseModel):
+    id: int
+    email: str
+    name: str
+
+    model_config = {"from_attributes": True}
 
 
-@app.get("/")
-def read_root():
-    """
-    Basic API status endpoint.
-    """
-
-    return {
-        "status": "online",
-        "message": "Algoverve Historical Data backend is running",
-    }
-
-
-# ============================================================================
-# HEALTH CHECK
-# ============================================================================
-
-
+# ================================================================ HEALTH
 @app.get("/health")
-def health_check():
-    """
-    Health check endpoint.
-    """
-
-    return {
-        "status": "healthy",
-    }
+def health():
+    return {"status": "healthy"}
 
 
-# ============================================================================
-# UPSTOX LOGIN
-# ============================================================================
-
-
-@app.get("/login")
-def login_upstox():
-    """
-    Step 1 of OAuth.
-
-    User visits:
-
-        http://127.0.0.1:8000/login
-
-    FastAPI redirects the browser to Upstox.
-    """
-
-    # ------------------------------------------------------------------------
-    # Validate environment variables
-    # ------------------------------------------------------------------------
-
-    if not UPSTOX_API_KEY:
+# ============================================================ APP AUTH
+@app.post("/auth/signup", response_model=UserOut, status_code=201)
+def sign_up(body: SignUpIn, response: Response, db: Session = Depends(get_db)):
+    email = body.email.lower().strip()
+    if db.query(User).filter(User.email == email).first():
         raise HTTPException(
-            status_code=500,
-            detail="UPSTOX_API_KEY is not configured",
+            status_code=409, detail="An account with this email already exists"
         )
 
-    if not UPSTOX_API_SECRET:
-        raise HTTPException(
-            status_code=500,
-            detail="UPSTOX_API_SECRET is not configured",
-        )
-
-    if not REDIRECT_URI:
-        raise HTTPException(
-            status_code=500,
-            detail="REDIRECT_URI is not configured",
-        )
-
-    # ------------------------------------------------------------------------
-    # Encode redirect URI
-    # ------------------------------------------------------------------------
-
-    encoded_redirect_uri = quote(
-        REDIRECT_URI,
-        safe="",
+    user = User(
+        email=email, name=body.name.strip(), password_hash=hash_password(body.password)
     )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
 
-    # ------------------------------------------------------------------------
-    # Build Upstox authorization URL
-    # ------------------------------------------------------------------------
+    set_session_cookie(response, user.id)
+    return user
 
-    auth_url = (
-        "https://api.upstox.com/v2/login/authorization/dialog"
-        "?response_type=code"
-        f"&client_id={UPSTOX_API_KEY}"
-        f"&redirect_uri={encoded_redirect_uri}"
+
+@app.post("/auth/login", response_model=UserOut)
+def sign_in(body: SignInIn, response: Response, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.email == body.email.lower().strip()).first()
+    if not user or not verify_password(body.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Incorrect email or password")
+
+    set_session_cookie(response, user.id)
+    return user
+
+
+@app.post("/auth/logout", status_code=204)
+def sign_out(response: Response):
+    clear_session_cookie(response)
+
+
+@app.get("/auth/me", response_model=UserOut)
+def me(user: User = Depends(get_current_user)):
+    return user
+
+
+# ========================================================= UPSTOX CONNECT
+def _frontend(result: str) -> RedirectResponse:
+    return RedirectResponse(f"{FRONTEND_URL}/?broker={result}", status_code=302)
+
+
+@app.get("/brokers/upstox/connect")
+def upstox_connect(user: User | None = Depends(get_optional_user)):
+    """Browser navigates here. We send it to Upstox with a signed `state`."""
+    if not user:
+        return _frontend("signin_required")
+    if not UPSTOX_API_KEY or not UPSTOX_API_SECRET:
+        raise HTTPException(
+            status_code=500, detail="Upstox credentials are not configured"
+        )
+
+    query = urlencode(
+        {
+            "response_type": "code",
+            "client_id": UPSTOX_API_KEY,
+            "redirect_uri": REDIRECT_URI,
+            "state": create_oauth_state(user.id),
+        }
     )
-
-    # ------------------------------------------------------------------------
-    # Redirect browser to Upstox
-    # ------------------------------------------------------------------------
-
     return RedirectResponse(
-        url=auth_url,
-        status_code=302,
+        f"{UPSTOX_BASE}/login/authorization/dialog?{query}", status_code=302
     )
-
-
-# ============================================================================
-# UPSTOX CALLBACK
-# ============================================================================
 
 
 @app.get("/callback")
-async def callback_upstox(
-    code: str = Query(...),
+async def upstox_callback(
+    code: str | None = Query(None),
+    state: str | None = Query(None),
+    user: User | None = Depends(get_optional_user),
     db: Session = Depends(get_db),
 ):
-    """
-    Step 2 of OAuth.
-
-    Upstox redirects the user here after successful authorization.
-
-    Example:
-
-        /callback?code=xxxxxxxx
-
-    We exchange that temporary authorization code
-    for an Upstox access token.
-    """
-
-    # ------------------------------------------------------------------------
-    # Validate credentials
-    # ------------------------------------------------------------------------
-
-    if not UPSTOX_API_KEY:
-        raise HTTPException(
-            status_code=500,
-            detail="UPSTOX_API_KEY is not configured",
-        )
-
-    if not UPSTOX_API_SECRET:
-        raise HTTPException(
-            status_code=500,
-            detail="UPSTOX_API_SECRET is not configured",
-        )
-
-    # ------------------------------------------------------------------------
-    # Upstox token endpoint
-    # ------------------------------------------------------------------------
-
-    token_url = "https://api.upstox.com/v2/login/authorization/token"
-
-    # ------------------------------------------------------------------------
-    # Request headers
-    # ------------------------------------------------------------------------
-
-    headers = {
-        "accept": "application/json",
-        "Content-Type": "application/x-www-form-urlencoded",
-    }
-
-    # ------------------------------------------------------------------------
-    # Request body
-    # ------------------------------------------------------------------------
-
-    payload = {
-        "code": code,
-        "client_id": UPSTOX_API_KEY,
-        "client_secret": UPSTOX_API_SECRET,
-        "redirect_uri": REDIRECT_URI,
-        "grant_type": "authorization_code",
-    }
-
-    # ------------------------------------------------------------------------
-    # Exchange authorization code for access token
-    # ------------------------------------------------------------------------
+    """Upstox sends the browser back here with ?code=...&state=..."""
+    # State proves this callback belongs to the signed-in user (blocks CSRF).
+    if not code or not state or not user or read_oauth_state(state) != user.id:
+        return _frontend("error")
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                token_url,
-                headers=headers,
-                data=payload,
+            res = await client.post(
+                f"{UPSTOX_BASE}/login/authorization/token",
+                headers={
+                    "accept": "application/json",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+                data={
+                    "code": code,
+                    "client_id": UPSTOX_API_KEY,
+                    "client_secret": UPSTOX_API_SECRET,
+                    "redirect_uri": REDIRECT_URI,
+                    "grant_type": "authorization_code",
+                },
             )
-
-    except httpx.RequestError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Unable to connect to Upstox: {str(exc)}",
-        ) from exc
-
-    # ------------------------------------------------------------------------
-    # Check Upstox response
-    # ------------------------------------------------------------------------
-
-    if response.status_code != 200:
-        raise HTTPException(
-            status_code=response.status_code,
-            detail={
-                "message": "Token exchange failed",
-                "upstox_response": response.text,
-            },
-        )
-
-    # ------------------------------------------------------------------------
-    # Parse response
-    # ------------------------------------------------------------------------
-
-    try:
-        token_data = response.json()
-
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail="Upstox returned an invalid JSON response",
-        ) from exc
-
-    # ------------------------------------------------------------------------
-    # Get access token
-    # ------------------------------------------------------------------------
+        token_data = res.json() if res.status_code == 200 else {}
+    except (httpx.RequestError, ValueError):
+        token_data = {}
 
     access_token = token_data.get("access_token")
-
     if not access_token:
-        raise HTTPException(
-            status_code=502,
-            detail="Upstox did not return an access token",
-        )
+        return _frontend("error")
 
-    # =========================================================================
-    # SAVE TOKEN TO NEON
-    # =========================================================================
-
-    try:
-        token_record = UpstoxToken(
-            access_token=access_token,
-        )
-
-        db.add(token_record)
-
-        db.commit()
-
-        db.refresh(token_record)
-
-    except Exception as exc:
-        db.rollback()
-
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to save Upstox token: {str(exc)}",
-        ) from exc
-
-    # ------------------------------------------------------------------------
-    # IMPORTANT
-    #
-    # Do NOT return the access token to React.
-    #
-    # React doesn't need it.
-    #
-    # React will call:
-    #
-    #     GET /user/profile
-    #
-    # and the backend will retrieve the token from Neon.
-    # ------------------------------------------------------------------------
-
-    # ------------------------------------------------------------------------
-    # Redirect back to React
-    # ------------------------------------------------------------------------
-
-    frontend_redirect = f"{FRONTEND_URL}/?auth=success"
-
-    return RedirectResponse(
-        url=frontend_redirect,
-        status_code=302,
+    # One Upstox account per user: update if it exists, else create.
+    account = (
+        db.query(BrokerAccount)
+        .filter(BrokerAccount.user_id == user.id, BrokerAccount.broker == UPSTOX)
+        .first()
     )
+    if not account:
+        account = BrokerAccount(user_id=user.id, broker=UPSTOX)
+        db.add(account)
+
+    account.broker_user_id = token_data.get("user_id")
+    account.access_token = encrypt_token(access_token)
+    account.refresh_token = None  # Upstox v2 doesn't issue refresh tokens
+
+    db.commit()
+    return _frontend("connected")
 
 
-# ============================================================================
-# GET USER PROFILE
-# ============================================================================
+# ========================================================= UPSTOX DATA
+def _upstox_account(db: Session, user: User) -> BrokerAccount:
+    account = (
+        db.query(BrokerAccount)
+        .filter(BrokerAccount.user_id == user.id, BrokerAccount.broker == UPSTOX)
+        .first()
+    )
+    if not account:
+        raise HTTPException(status_code=404, detail="Upstox is not connected")
+    return account
 
 
-@app.get("/user/profile")
-async def get_user_profile(
+@app.get("/brokers/upstox/profile")
+async def upstox_profile(
+    user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """
-    Fetch the authenticated Upstox user's profile.
-
-    Flow:
-
-        React
-          ↓
-        GET /user/profile
-          ↓
-        Neon
-          ↓
-        access_token
-          ↓
-        Upstox
-          ↓
-        profile
-          ↓
-        React
-    """
-
-    # =========================================================================
-    # GET LATEST TOKEN FROM DATABASE
-    # =========================================================================
-
-    token_record = db.query(UpstoxToken).order_by(UpstoxToken.created_at.desc()).first()
-
-    # ------------------------------------------------------------------------
-    # No token
-    # ------------------------------------------------------------------------
-
-    if not token_record:
+    account = _upstox_account(db, user)
+    token = decrypt_token(account.access_token)
+    if not token:
         raise HTTPException(
-            status_code=401,
-            detail="User is not authenticated with Upstox",
+            status_code=403, detail="Upstox session is invalid. Connect again."
         )
-
-    access_token = token_record.access_token
-
-    if not access_token:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid Upstox access token",
-        )
-
-    # =========================================================================
-    # CALL UPSTOX PROFILE API
-    # =========================================================================
-
-    profile_url = "https://api.upstox.com/v2/user/profile"
-
-    headers = {
-        "accept": "application/json",
-        "Authorization": f"Bearer {access_token}",
-    }
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(
-                profile_url,
-                headers=headers,
+            res = await client.get(
+                f"{UPSTOX_BASE}/user/profile",
+                headers={
+                    "accept": "application/json",
+                    "Authorization": f"Bearer {token}",
+                },
             )
-
     except httpx.RequestError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Unable to connect to Upstox: {str(exc)}",
-        ) from exc
+        raise HTTPException(status_code=502, detail="Couldn’t reach Upstox") from exc
 
-    # =========================================================================
-    # HANDLE TOKEN EXPIRATION
-    # =========================================================================
-
-    if response.status_code == 401:
+    if res.status_code == 401:
+        # Upstox tokens expire daily. 403 = "your broker session", not "your Algoverve login".
         raise HTTPException(
-            status_code=401,
-            detail="Upstox access token is expired or invalid",
+            status_code=403, detail="Upstox session expired. Connect again."
         )
+    if res.status_code != 200:
+        raise HTTPException(status_code=502, detail="Upstox returned an error")
 
-    # =========================================================================
-    # OTHER UPSTOX ERRORS
-    # =========================================================================
-
-    if response.status_code != 200:
-        raise HTTPException(
-            status_code=response.status_code,
-            detail={
-                "message": "Failed to fetch Upstox profile",
-                "upstox_response": response.text,
-            },
-        )
-
-    # =========================================================================
-    # RETURN PROFILE
-    # =========================================================================
-
-    try:
-        profile_data = response.json()
-
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail="Upstox returned invalid profile data",
-        ) from exc
-
-    return profile_data
+    return res.json()
 
 
-# ============================================================================
-# UPSTOX LOGOUT
-# ============================================================================
+@app.delete("/brokers/upstox", status_code=200)
+async def upstox_disconnect(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    account = (
+        db.query(BrokerAccount)
+        .filter(BrokerAccount.user_id == user.id, BrokerAccount.broker == UPSTOX)
+        .first()
+    )
+    if not account:
+        return {"status": "success", "data": {"upstox_revoked": True}}
 
-
-@app.delete("/logout")
-async def logout_upstox(db: Session = Depends(get_db)):
-    """
-    Ends the Upstox session and removes stored tokens.
-    Idempotent: returns success even if nothing is connected.
-    """
-
-    token_record = db.query(UpstoxToken).order_by(UpstoxToken.created_at.desc()).first()
-
-    upstox_revoked = True
-
-    if token_record and token_record.access_token:
+    revoked = True
+    token = decrypt_token(account.access_token)
+    if token:
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:
-                response = await client.delete(
-                    "https://api.upstox.com/v2/logout",
+                res = await client.delete(
+                    f"{UPSTOX_BASE}/logout",
                     headers={
                         "Accept": "application/json",
-                        "Authorization": f"Bearer {token_record.access_token}",
+                        "Authorization": f"Bearer {token}",
                     },
                 )
-            # 401 = token already expired/invalid → session is already dead
-            upstox_revoked = response.status_code in (200, 401)
+            revoked = res.status_code in (200, 401)
         except httpx.RequestError:
-            upstox_revoked = False
+            revoked = False
 
-    # Always clear local tokens so the app can't keep using them
-    try:
-        db.query(UpstoxToken).delete()
-        db.commit()
-    except Exception as exc:
-        db.rollback()
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to clear Upstox token: {str(exc)}",
-        ) from exc
-
-    return {"status": "success", "data": {"upstox_revoked": upstox_revoked}}
+    db.delete(account)  # always remove our copy
+    db.commit()
+    return {"status": "success", "data": {"upstox_revoked": revoked}}
