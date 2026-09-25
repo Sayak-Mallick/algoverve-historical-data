@@ -1,0 +1,38 @@
+@import url("https://fonts.googleapis.com/css2?family=Lato:wght@400;700;900&display=swap");
+@import "tailwindcss";
+
+/* Slack design tokens → Tailwind utilities (bg-aubergine-900, text-ink-2, etc.) */
+@theme {
+  --font-sans: "Lato", "Helvetica Neue", Helvetica, Arial, sans-serif;
+
+  --color-aubergine: #4a154b;
+  --color-aubergine-900: #3f0e40;
+  --color-aubergine-950: #350d36;
+  --color-selected: #1164a3;
+
+  --color-green: #007a5a;
+  --color-green-hover: #148567;
+  --color-green-press: #006b4f;
+  --color-green-tint: #e3f1ec;
+  --color-presence: #2bac76;
+
+  --color-ink: #1d1c1d;
+  --color-ink-2: #616061;
+  --color-ink-3: #868686;
+  --color-line: #dddddd;
+  --color-line-strong: #bbbabb;
+  --color-surface-2: #f8f8f8;
+
+  --color-danger: #e01e5a;
+  --color-danger-tint: #fdf2f5;
+  --color-danger-line: #f1c3d2;
+  --color-focus: #1d9bd1;
+}
+
+@layer base {
+  html, body, #root { height: 100%; }
+  body {
+    @apply bg-aubergine-950 font-sans text-[15px] leading-[1.4667] text-ink antialiased;
+  }
+  :focus-visible { @apply outline-2 outline-offset-2 outline-focus; }
+}
