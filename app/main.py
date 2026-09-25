@@ -3,10 +3,15 @@ from urllib.parse import quote
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import RedirectResponse
+from sqlalchemy.orm import Session
 
-# Load environment variables from .env file
+from app import models
+from app.database import Base, engine, get_db
+from app.models import UpstoxToken
+
+# Load environment variables
 load_dotenv()
 
 UPSTOX_API_KEY = os.getenv("UPSTOX_API_KEY")
@@ -15,8 +20,8 @@ REDIRECT_URI = os.getenv("REDIRECT_URI", "http://127.0.0.1:8000/callback")
 
 app = FastAPI(title="Algoverve Historical Data backend")
 
-# In-memory storage for active sessions (use Redis or a DB in production)
-tokens_db = {}
+# Automatically create tables in Neon database on startup
+Base.metadata.create_all(bind=engine)
 
 
 @app.get("/")
@@ -41,7 +46,7 @@ def login_upstox():
             detail="Missing UPSTOX_API_KEY or REDIRECT_URI environment variables",
         )
 
-    # URL-encode the redirect URI to prevent special character matching issues (UDAPI100068)
+    # URL-encode the redirect URI to prevent character matching issues (UDAPI100068)
     encoded_redirect_uri = quote(REDIRECT_URI, safe="")
     auth_url = (
         f"https://api.upstox.com/v2/login/authorization/dialog"
@@ -51,8 +56,11 @@ def login_upstox():
 
 
 @app.get("/callback")
-async def callback_upstox(code: str = Query(...)):
-    """Step 2: Receive auth code from Upstox redirect and exchange for Access Token"""
+async def callback_upstox(
+    code: str = Query(...),
+    db: Session = Depends(get_db),
+):
+    """Step 2: Receive auth code from Upstox redirect, exchange for Access Token, and save to Neon DB"""
     token_url = "https://api.upstox.com/v2/login/authorization/token"
 
     headers = {
@@ -80,34 +88,50 @@ async def callback_upstox(code: str = Query(...)):
     token_data = response.json()
     access_token = token_data.get("access_token")
 
-    # Store token in memory
-    tokens_db["access_token"] = access_token
+    if not access_token:
+        raise HTTPException(
+            status_code=500,
+            detail="Access token not found in response from Upstox",
+        )
+
+    # Save access token to Neon database
+    token_entry = UpstoxToken(access_token=access_token)
+    db.add(token_entry)
+    db.commit()
+    db.refresh(token_entry)
 
     return {
         "status": "success",
-        "message": "Authentication successful",
-        "access_token": access_token,
-        "user_details": token_data,
+        "message": "Authentication successful and token saved to database",
+        "token_id": token_entry.id,
     }
 
 
 @app.get("/user/profile")
-async def get_user_profile():
-    """Example endpoint making an authenticated call using the stored token"""
-    access_token = tokens_db.get("access_token")
-    if not access_token:
+async def get_user_profile(db: Session = Depends(get_db)):
+    """Fetch profile of authenticated user using the latest token stored in Neon DB"""
+    token_entry = db.query(UpstoxToken).order_by(UpstoxToken.created_at.desc()).first()
+
+    if not token_entry:
         raise HTTPException(
-            status_code=401, detail="User not authenticated with Upstox"
+            status_code=401,
+            detail="User not authenticated with Upstox",
         )
 
     headers = {
         "accept": "application/json",
-        "Authorization": f"Bearer {access_token}",
+        "Authorization": f"Bearer {token_entry.access_token}",
     }
 
     async with httpx.AsyncClient() as client:
         response = await client.get(
             "https://api.upstox.com/v2/user/profile", headers=headers
+        )
+
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=f"Failed to retrieve profile: {response.text}",
         )
 
     return response.json()
